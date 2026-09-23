@@ -2001,25 +2001,18 @@ impl LiteralPrefixCapture {
         let known_utf8 = input.haystack_is_known_valid_utf8();
         let check_capture = self.capture_requires_utf8 && !known_utf8;
         let check_tail = self.tail_requires_utf8 && !known_utf8;
-        'prefix: for prefix in self.prefixes.iter() {
+        for prefix in self.prefixes.iter() {
             if !bytes.starts_with(prefix) {
                 continue;
             }
             let cap_start = prefix.len();
-            let mut scan_start = cap_start;
-            let off = loop {
-                let Some(next) = crate::util::memchr::memchr2(
-                    self.terminator,
-                    b'\n',
-                    &bytes[scan_start..],
-                ) else {
-                    continue 'prefix;
-                };
-                let found = scan_start + next;
-                if bytes[found] == self.terminator {
-                    break found - cap_start;
-                }
-                scan_start = found + 1;
+            // `[^X]+` can't contain X, so the capture must end at the
+            // first X. Newlines are fine inside the capture.
+            let Some(off) = crate::util::memchr::memchr(
+                self.terminator,
+                &bytes[cap_start..],
+            ) else {
+                continue;
             };
             if off == 0 {
                 // `[^X]+` requires >= 1 byte; try the next possible prefix.
