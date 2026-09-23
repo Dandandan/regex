@@ -1940,9 +1940,12 @@ struct LiteralPrefixCapture {
     /// Single ASCII byte ending the capture (also the literal that must
     /// follow the capture in the original regex).
     terminator: u8,
-    /// Whether capture/tail classes were Unicode classes. When true, the
-    /// byte fast path must still reject invalid UTF-8 haystacks.
-    requires_valid_utf8: bool,
+    /// Whether the capture class is a Unicode class, in which case the
+    /// captured span must be valid UTF-8.
+    capture_requires_utf8: bool,
+    /// Whether the `.*` class is a Unicode class, in which case the span
+    /// after the terminator must be valid UTF-8.
+    tail_requires_utf8: bool,
 }
 
 /// Each `(?:...)?` doubles the count and each `(a|b|c)` multiplies it,
@@ -1969,17 +1972,15 @@ impl LiteralPrefixCapture {
         if core.info.config().get_line_terminator() != b'\n' {
             return Err(core);
         }
-        let allow_unicode_classes = core.info.config().get_utf8_empty();
-        let Some((prefixes, terminator, requires_valid_utf8)) =
-            try_recognize_prefix_capture(hirs[0], allow_unicode_classes)
-        else {
+        let Some(lpc) = try_recognize_prefix_capture(hirs[0]) else {
             return Err(core);
         };
         Ok(LiteralPrefixCapture {
             core,
-            prefixes,
-            terminator,
-            requires_valid_utf8,
+            prefixes: lpc.prefixes,
+            terminator: lpc.terminator,
+            capture_requires_utf8: lpc.capture_requires_utf8,
+            tail_requires_utf8: lpc.tail_requires_utf8,
         })
     }
 
@@ -1997,8 +1998,9 @@ impl LiteralPrefixCapture {
             return None;
         }
         let bytes = input.haystack();
-        let must_validate_utf8 =
-            self.requires_valid_utf8 && !input.haystack_is_known_valid_utf8();
+        let known_utf8 = input.haystack_is_known_valid_utf8();
+        let check_capture = self.capture_requires_utf8 && !known_utf8;
+        let check_tail = self.tail_requires_utf8 && !known_utf8;
         'prefix: for prefix in self.prefixes.iter() {
             if !bytes.starts_with(prefix) {
                 continue;
@@ -2031,8 +2033,20 @@ impl LiteralPrefixCapture {
             {
                 continue;
             }
-            if must_validate_utf8 && core::str::from_utf8(bytes).is_err() {
-                return None;
+            // A Unicode class only matches valid UTF-8, but the prefix and
+            // any `(?-u:...)` span may legitimately contain invalid UTF-8
+            // (when UTF-8 mode is disabled), so validate exactly the spans
+            // matched by Unicode classes. A failure only rules out this
+            // prefix, since another prefix yields a different capture span.
+            if check_capture
+                && core::str::from_utf8(&bytes[cap_start..cap_end]).is_err()
+            {
+                continue;
+            }
+            if check_tail
+                && core::str::from_utf8(&bytes[cap_end + 1..]).is_err()
+            {
+                continue;
             }
             return Some((cap_start, cap_end));
         }
@@ -2122,12 +2136,17 @@ impl Strategy for LiteralPrefixCapture {
     }
 }
 
+/// The pieces of a recognized `^<prefix-set>([^X]+)X.*$` regex.
+struct RecognizedPrefixCapture {
+    prefixes: Box<[Box<[u8]>]>,
+    terminator: u8,
+    capture_requires_utf8: bool,
+    tail_requires_utf8: bool,
+}
+
 /// Recognizes `^<prefix-set>([^X]+)X.*$` (default flags) and returns the
 /// enumerated prefix set together with the terminator byte X.
-fn try_recognize_prefix_capture(
-    hir: &Hir,
-    allow_unicode_classes: bool,
-) -> Option<(Box<[Box<[u8]>]>, u8, bool)> {
+fn try_recognize_prefix_capture(hir: &Hir) -> Option<RecognizedPrefixCapture> {
     let HirKind::Concat(parts) = hir.kind() else {
         return None;
     };
@@ -2153,7 +2172,7 @@ fn try_recognize_prefix_capture(
         return None;
     }
     let (terminator, capture_requires_utf8) =
-        capture_terminator_byte(&cap.sub, allow_unicode_classes)?;
+        capture_terminator_byte(&cap.sub)?;
 
     let HirKind::Literal(Literal(lit)) = iter.next()?.kind() else {
         return None;
@@ -2162,8 +2181,7 @@ fn try_recognize_prefix_capture(
         return None;
     }
 
-    let dot_star_requires_utf8 =
-        dot_star_requires_valid_utf8(iter.next()?, allow_unicode_classes)?;
+    let tail_requires_utf8 = dot_star_requires_valid_utf8(iter.next()?)?;
 
     if !matches!(iter.next()?.kind(), HirKind::Look(Look::End)) {
         return None;
@@ -2181,8 +2199,12 @@ fn try_recognize_prefix_capture(
     let prefixes: Vec<Box<[u8]>> =
         deduped.into_iter().map(Vec::into_boxed_slice).collect();
 
-    let requires_valid_utf8 = capture_requires_utf8 || dot_star_requires_utf8;
-    Some((prefixes.into_boxed_slice(), terminator, requires_valid_utf8))
+    Some(RecognizedPrefixCapture {
+        prefixes: prefixes.into_boxed_slice(),
+        terminator,
+        capture_requires_utf8,
+        tail_requires_utf8,
+    })
 }
 
 /// Return all literal variants for one prefix segment in regex-priority
@@ -2249,10 +2271,7 @@ fn concat_prefix_variants(
 }
 
 /// Capture must be a greedy `[^X]+` over a single ASCII byte X.
-fn capture_terminator_byte(
-    hir: &Hir,
-    allow_unicode_classes: bool,
-) -> Option<(u8, bool)> {
+fn capture_terminator_byte(hir: &Hir) -> Option<(u8, bool)> {
     let HirKind::Repetition(rep) = hir.kind() else {
         return None;
     };
@@ -2262,14 +2281,11 @@ fn capture_terminator_byte(
     let HirKind::Class(class) = rep.sub.kind() else {
         return None;
     };
-    single_excluded_ascii_byte(class, allow_unicode_classes)
+    single_excluded_ascii_byte(class)
 }
 
 /// `.*` for default-flag regexes: any byte except `\n`, zero or more, greedy.
-fn dot_star_requires_valid_utf8(
-    hir: &Hir,
-    allow_unicode_classes: bool,
-) -> Option<bool> {
+fn dot_star_requires_valid_utf8(hir: &Hir) -> Option<bool> {
     let HirKind::Repetition(rep) = hir.kind() else {
         return None;
     };
@@ -2279,8 +2295,7 @@ fn dot_star_requires_valid_utf8(
     let HirKind::Class(class) = rep.sub.kind() else {
         return None;
     };
-    let (excluded, requires_valid_utf8) =
-        single_excluded_ascii_byte(class, allow_unicode_classes)?;
+    let (excluded, requires_valid_utf8) = single_excluded_ascii_byte(class)?;
     if excluded == b'\n' {
         Some(requires_valid_utf8)
     } else {
@@ -2288,18 +2303,13 @@ fn dot_star_requires_valid_utf8(
     }
 }
 
-/// Returns `Some(b)` iff `class` matches every codepoint or byte except a
-/// single ASCII byte `b`. ASCII-only because the runtime matcher uses
-/// `memchr` over byte slices.
-fn single_excluded_ascii_byte(
-    class: &Class,
-    allow_unicode_classes: bool,
-) -> Option<(u8, bool)> {
+/// Returns `Some((b, is_unicode))` iff `class` matches every codepoint or
+/// byte except a single ASCII byte `b`. ASCII-only because the runtime
+/// matcher uses `memchr` over byte slices. `is_unicode` is true when the
+/// class only matches valid UTF-8.
+fn single_excluded_ascii_byte(class: &Class) -> Option<(u8, bool)> {
     match class {
         Class::Unicode(uc) => {
-            if !allow_unicode_classes {
-                return None;
-            }
             let ranges = uc.ranges();
             if ranges.len() != 2 {
                 return None;

@@ -175,3 +175,40 @@ fn literal_prefix_capture_bytes_unicode_rejects_invalid_utf8() {
         .unwrap();
     assert!(re.is_match(b"a\xFF/x"));
 }
+
+#[test]
+fn literal_prefix_capture_meta_non_utf8_mode_validates_only_unicode_spans() {
+    use regex_automata::{meta, util::syntax, Input};
+
+    let build = |pat: &str| {
+        meta::Builder::new()
+            .syntax(syntax::Config::new().utf8(false))
+            .build(pat)
+            .unwrap()
+    };
+    // Byte-class capture, Unicode `.*` tail: invalid UTF-8 in the capture
+    // is fine, and the tail is empty.
+    let re = build(r"^((?-u:[^/])+)/.*$");
+    assert!(re.is_match(Input::new(b"\xA9/")));
+    // Unicode capture, byte-class tail: invalid UTF-8 in the tail is fine.
+    let re = build(r"^([^\n]+)\n(?-u:.)*$");
+    assert!(re.is_match(Input::new(b"x\na\xA9bb")));
+    // Invalid UTF-8 in a literal prefix is fine.
+    let re = build(r"^(?-u:\xFF)([^/]+)/.*$");
+    let mut caps = re.create_captures();
+    re.captures(Input::new(b"\xFFab/x"), &mut caps);
+    assert_eq!(Some(1..3), caps.get_group(1).map(|s| s.range()));
+    // But Unicode spans still must be valid UTF-8.
+    assert!(!re.is_match(Input::new(b"\xFFa\xFF/x")));
+    assert!(!re.is_match(Input::new(b"\xFFab/\xFF")));
+}
+
+#[test]
+fn literal_prefix_capture_bytes_unicode_captures() {
+    let re = regex::bytes::Regex::new(r"^https?://(?:www\.)?([^/]+)/.*$")
+        .unwrap();
+    let caps = re.captures(b"https://www.\xC3\xA9x.com/p\xC3\xA9").unwrap();
+    assert_eq!(&b"\xC3\xA9x.com"[..], caps.get(1).unwrap().as_bytes());
+    assert!(re.captures(b"https://www.\xC3x.com/p").is_none());
+    assert!(re.captures(b"https://www.x.com/p\xFF").is_none());
+}
