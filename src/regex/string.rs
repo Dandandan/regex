@@ -951,6 +951,41 @@ impl Regex {
         // (`$N` / `${N}`), each match's output is just the captured slice,
         // so we can skip `Captures::expand`.
         if let Some(group_idx) = rep.single_capture_ref() {
+            // For a single replacement of a low-numbered group, the slots
+            // for group 0 and group N fit on the stack, so we can avoid
+            // allocating a `Captures` at all.
+            if limit == 1 && group_idx < 4 && group_idx < self.captures_len() {
+                let mut slots = [None; 8];
+                let slots = &mut slots[..2 * (group_idx + 1)];
+                let input = Input::new_utf8(haystack);
+                if self.meta.search_slots(&input, slots).is_none() {
+                    return Cow::Borrowed(haystack);
+                }
+                let span = |i: usize| -> Option<(usize, usize)> {
+                    Some((slots[2 * i]?.get(), slots[2 * i + 1]?.get()))
+                };
+                // unwrap on 0 is OK because a match always sets group 0
+                let (mstart, mend) = span(0).unwrap();
+                let g = span(group_idx);
+                if mstart == 0 && mend == haystack.len() {
+                    return match g {
+                        Some((s, e)) if s == 0 && e == haystack.len() => {
+                            Cow::Borrowed(haystack)
+                        }
+                        Some((s, e)) => {
+                            Cow::Owned(String::from(&haystack[s..e]))
+                        }
+                        None => Cow::Owned(String::new()),
+                    };
+                }
+                let mut new = String::with_capacity(haystack.len());
+                new.push_str(&haystack[..mstart]);
+                if let Some((s, e)) = g {
+                    new.push_str(&haystack[s..e]);
+                }
+                new.push_str(&haystack[mend..]);
+                return Cow::Owned(new);
+            }
             if limit == 1 {
                 let Some(cap) = self.captures(haystack) else {
                     return Cow::Borrowed(haystack);
@@ -1002,6 +1037,21 @@ impl Regex {
 
         // The slower path, which we use if the replacement may need access to
         // capture groups.
+        //
+        // For a single replacement, skip the iterator machinery (which
+        // allocates a `Captures` on construction and clones it per match).
+        if limit == 1 {
+            let Some(cap) = self.captures(haystack) else {
+                return Cow::Borrowed(haystack);
+            };
+            // unwrap on 0 is OK because captures only reports matches
+            let m = cap.get(0).unwrap();
+            let mut new = String::with_capacity(haystack.len());
+            new.push_str(&haystack[..m.start()]);
+            rep.replace_append(&cap, &mut new);
+            new.push_str(&haystack[m.end()..]);
+            return Cow::Owned(new);
+        }
         let mut it = self.captures_iter(haystack).enumerate().peekable();
         if it.peek().is_none() {
             return Cow::Borrowed(haystack);

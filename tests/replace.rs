@@ -225,3 +225,30 @@ fn replace_literal_prefix_capture_backtracks_after_tail_newline() {
     let re = regex::Regex::new(r"^(?:a|ab/b\nc)([^/]+)/.*$").unwrap();
     assert_eq!(re.replace("ab/b\ncd/e", "$1"), "d");
 }
+
+#[test]
+fn replace_single_capture_ref_stack_slots() {
+    let re = regex::Regex::new(r"(a)(b)?(c)").unwrap();
+    // Match in the middle of the haystack.
+    assert_eq!(re.replace("xxabcyy", "$1"), "xxayy");
+    assert_eq!(re.replace("xxabcyy", "${3}"), "xxcyy");
+    // A group that didn't participate expands to nothing.
+    assert_eq!(re.replace("xxacyy", "$2"), "xxyy");
+    // Groups that don't exist (or are past the stack slots) expand to
+    // nothing, just like `Captures::expand`.
+    assert_eq!(re.replace("xxabcyy", "$4"), "xxyy");
+    assert_eq!(re.replace("xxabcyy", "$9"), "xxyy");
+    // No match borrows.
+    assert!(matches!(re.replace("xyz", "$1"), std::borrow::Cow::Borrowed(_)));
+    // Whole-haystack match whose group is the whole haystack borrows.
+    let re = regex::Regex::new(r"^(.*)$").unwrap();
+    assert!(matches!(re.replace("abc", "$1"), std::borrow::Cow::Borrowed(_)));
+    assert_eq!(re.replace("abc", "$1"), "abc");
+}
+
+#[test]
+fn replace_first_with_template() {
+    let re = regex::Regex::new(r"(\w+)@(\w+)").unwrap();
+    assert_eq!(re.replace("to: a@b, c@d", "$2 at $1"), "to: b at a, c@d");
+    assert_eq!(re.replace("nothing here", "$2 at $1"), "nothing here");
+}
